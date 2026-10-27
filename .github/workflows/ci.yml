@@ -1,0 +1,210 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          python3 << 'PY'
+          import os, re, subprocess, sys
+
+          required_major = 26
+
+          def version_key(text):
+              return tuple(int(part) for part in re.findall(r"\d+", text))
+
+          def capture(cmd, developer_dir):
+              env = os.environ.copy()
+              env["DEVELOPER_DIR"] = developer_dir
+              result = subprocess.run(cmd, text=True, capture_output=True, env=env)
+              if result.returncode != 0:
+                  print(result.stdout)
+                  print(result.stderr, file=sys.stderr)
+                  return ""
+              return result.stdout
+
+          apps = []
+          for entry in sorted(os.listdir("/Applications")):
+              if entry.startswith("Xcode") and entry.endswith(".app"):
+                  apps.append(os.path.join("/Applications", entry))
+
+          best = None
+          for app in apps:
+              developer_dir = os.path.join(app, "Contents", "Developer")
+              if not os.path.isdir(developer_dir):
+                  continue
+              version_text = capture(["xcodebuild", "-version"], developer_dir)
+              sdk_text = capture(["xcodebuild", "-showsdks"], developer_dir)
+              if not version_text:
+                  print(f"skip {app}: xcodebuild -version failed")
+                  continue
+              version = version_text.splitlines()[0].replace("Xcode", "").strip()
+              sdks = re.findall(r"-sdk iphoneos(\d+(?:\.\d+)*)", sdk_text)
+              if not sdks:
+                  print(f"skip {app}: Xcode {version} has no iOS SDK")
+                  continue
+              sdk = max(sdks, key=version_key)
+              major = version_key(sdk)[0]
+              print(f"found Xcode {version} at {app} with iOS SDK {sdk}")
+              if major < required_major:
+                  continue
+              if best is None or version_key(version) > version_key(best["version"]):
+                  best = {
+                      "version": version,
+                      "sdk": sdk,
+                      "developer_dir": developer_dir,
+                  }
+
+          if best is None:
+              sys.exit(f"No installed Xcode provides the iOS {required_major} SDK")
+
+          print(f"selected Xcode {best['version']} (iOS SDK {best['sdk']})")
+          subprocess.check_call(["sudo", "xcode-select", "-s", best["developer_dir"]])
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"DEVELOPER_DIR={best['developer_dir']}\n")
+              handle.write(f"SELECTED_XCODE_VERSION={best['version']}\n")
+              handle.write(f"SELECTED_IOS_SDK={best['sdk']}\n")
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write(f"- Xcode {best['version']} (iOS SDK {best['sdk']})\n")
+          PY
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Select iPhone simulator
+        run: |
+          python3 << 'PY'
+          import json, os, re, subprocess, sys
+
+          def version_key(text):
+              return tuple(int(part) for part in re.findall(r"\d+", text))
+
+          def run(args):
+              return subprocess.check_output(args, text=True)
+
+          devices = json.loads(run(["xcrun", "simctl", "list", "devices", "available", "-j"]))
+          candidates = []
+          for runtime, entries in devices.get("devices", {}).items():
+              if "iOS" not in runtime:
+                  continue
+              for device in entries:
+                  name = device.get("name", "")
+                  if device.get("isAvailable") and "iPhone" in name and device.get("udid"):
+                      candidates.append((version_key(runtime), runtime, name, device["udid"]))
+
+          if candidates:
+              newest = max(item[0] for item in candidates)
+              pool = [item for item in candidates if item[0] == newest]
+              pool.sort(key=lambda item: (len(item[2]), item[2]))
+              _, runtime, name, udid = pool[0]
+          else:
+              print("No available iPhone simulator; creating one")
+              runtimes = json.loads(run(["xcrun", "simctl", "list", "runtimes", "available", "-j"]))
+              ios_runtimes = []
+              for runtime in runtimes.get("runtimes", []):
+                  identifier = runtime.get("identifier", "")
+                  runtime_name = runtime.get("name", "")
+                  version = str(runtime.get("version") or runtime_name)
+                  if not runtime.get("isAvailable", False):
+                      continue
+                  if "iOS" not in runtime_name and "iOS" not in identifier:
+                      continue
+                  numbers = version_key(version)
+                  if not numbers or numbers[0] < 26:
+                      continue
+                  ios_runtimes.append((numbers, identifier, runtime_name))
+              if not ios_runtimes:
+                  sys.exit("No available iOS 26+ simulator runtime")
+              ios_runtimes.sort()
+              runtime = ios_runtimes[-1][1]
+              device_types = json.loads(run(["xcrun", "simctl", "list", "devicetypes", "-j"]))
+              iphones = [
+                  item for item in device_types.get("devicetypes", [])
+                  if "iPhone" in item.get("name", "")
+              ]
+              if not iphones:
+                  sys.exit("No iPhone simulator device type is installed")
+
+              def type_rank(item):
+                  type_name = item["name"]
+                  penalty = sum(word in type_name for word in ("Pro", "Max", "SE", "mini", "Air", "Plus"))
+                  return (penalty, len(type_name), type_name)
+
+              iphones.sort(key=type_rank)
+              chosen = iphones[0]
+              name = chosen["name"]
+              udid = run(["xcrun", "simctl", "create", "mySpotify CI", chosen["identifier"], runtime]).strip()
+
+          print(f"Using {name} ({udid}) from {runtime}")
+          destination = f"platform=iOS Simulator,id={udid}"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"DESTINATION={destination}\n")
+              handle.write(f"SIMULATOR_UDID={udid}\n")
+              handle.write(f"SIMULATOR_NAME={name}\n")
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write(f"- Simulator: {name}\n")
+          PY
+
+      - name: Boot simulator
+        run: |
+          xcrun simctl boot "$SIMULATOR_UDID" || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+
+      - name: Build
+        run: |
+          xcodebuild build \
+            -project mySpotify.xcodeproj \
+            -scheme mySpotify \
+            -destination "$DESTINATION" \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Verify audio background mode
+        run: |
+          PLIST="$(find "$GITHUB_WORKSPACE/build/Build/Products" -path '*mySpotify.app/Info.plist' | head -n 1)"
+          if [[ -z "$PLIST" ]]; then
+            echo "Built Info.plist was not found"
+            exit 1
+          fi
+          echo "Info.plist: $PLIST"
+          plutil -p "$PLIST"
+          plutil -extract UIBackgroundModes json -o - "$PLIST" | grep -q '"audio"'
+
+      - name: Test
+        run: |
+          xcodebuild test \
+            -project mySpotify.xcodeproj \
+            -scheme mySpotify \
+            -destination "$DESTINATION" \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            -parallel-testing-enabled NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
