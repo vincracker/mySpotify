@@ -5,6 +5,9 @@ xcuserdata/
 *.xccheckout
 DerivedData/
 build/
+TestResults.xcresult
+screenshots-export/
+screenshots-named/
 *.moved-aside
 *.hmap
 *.ipa

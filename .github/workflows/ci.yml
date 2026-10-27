@@ -197,6 +197,7 @@ jobs:
 
       - name: Test
         run: |
+          rm -rf "$GITHUB_WORKSPACE/TestResults.xcresult"
           xcodebuild test \
             -project mySpotify.xcodeproj \
             -scheme mySpotify \
@@ -204,7 +205,57 @@ jobs:
             -configuration Debug \
             -sdk iphonesimulator \
             -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            -resultBundlePath "$GITHUB_WORKSPACE/TestResults.xcresult" \
             -parallel-testing-enabled NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
+
+      - name: Export screenshots
+        if: success()
+        run: |
+          xcrun xcresulttool export attachments \
+            --path "$GITHUB_WORKSPACE/TestResults.xcresult" \
+            --output-path "$GITHUB_WORKSPACE/screenshots-export"
+          python3 << 'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          staging = Path("screenshots-export")
+          manifest_path = staging / "manifest.json"
+          if not manifest_path.exists():
+              sys.exit(f"No manifest at {manifest_path}")
+          manifest = json.loads(manifest_path.read_text())
+          records = manifest if isinstance(manifest, list) else [manifest]
+          named = Path("screenshots-named")
+          named.mkdir(exist_ok=True)
+          wanted = ["library-light", "library-dark", "playlists-light", "playlists-dark"]
+          found = set()
+          for record in records:
+              attachments = record.get("attachments", []) if isinstance(record, dict) else []
+              for attachment in attachments:
+                  readable = attachment.get("suggestedHumanReadableName") or ""
+                  exported = attachment.get("exportedFileName") or ""
+                  stem = Path(readable).stem
+                  source = staging / exported
+                  match = next((name for name in wanted if stem == name or readable.startswith(name)), None)
+                  if match and source.is_file():
+                      target = named / f"{match}.png"
+                      target.write_bytes(source.read_bytes())
+                      found.add(match)
+          missing = [name for name in wanted if name not in found]
+          print(manifest_path.read_text())
+          if missing:
+              sys.exit(f"Missing screenshots: {', '.join(missing)}")
+          for name in wanted:
+              print(named / f"{name}.png")
+          PY
+
+      - name: Upload screenshots
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-screenshots
+          path: screenshots-named/*.png
+          if-no-files-found: error

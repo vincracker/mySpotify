@@ -10,5 +10,17 @@ struct RootView: View {
                 PlaylistsView()
             }
         }
+        .preferredColorScheme(uiTestColorScheme)
+    }
+
+    private var uiTestColorScheme: ColorScheme? {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-UITestDarkMode") {
+            return .dark
+        }
+        if arguments.contains("-UITestLightMode") {
+            return .light
+        }
+        return nil
     }
 }
